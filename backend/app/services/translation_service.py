@@ -115,7 +115,7 @@ async def translate_to_english(hindi_text: str) -> str:
                     return_tensors="pt", 
                     padding=True, 
                     truncation=True, 
-                    max_length=256  
+                    max_length=512  # enough for Devanagari input tokens
                 ).to(DEVICE)
                 
                 generated_tokens = model_instance.generate(
@@ -123,7 +123,7 @@ async def translate_to_english(hindi_text: str) -> str:
                     forced_bos_token_id=tokenizer_instance.convert_tokens_to_ids(tgt_lang),
                     use_cache=False, 
                     min_length=0, 
-                    max_length=256,  
+                    max_new_tokens=512,  # new tokens only, not total length
                     num_beams=3,  
                     num_return_sequences=1
                 )
@@ -151,7 +151,7 @@ async def translate_to_english(hindi_text: str) -> str:
                 return_tensors="pt", 
                 padding=True, 
                 truncation=True, 
-                max_length=256
+                max_length=512
             ).to(DEVICE)
 
             generated_tokens = model_instance.generate(
@@ -159,7 +159,7 @@ async def translate_to_english(hindi_text: str) -> str:
                 forced_bos_token_id=tokenizer_instance.convert_tokens_to_ids(tgt_lang),
                 use_cache=False, 
                 min_length=0, 
-                max_length=256, 
+                max_new_tokens=512, 
                 num_beams=3, 
                 num_return_sequences=1
             )

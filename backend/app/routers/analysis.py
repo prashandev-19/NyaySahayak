@@ -32,7 +32,11 @@ async def analyze_case_file_rag(file: UploadFile = File(...)):
         logger.info(f"OCR extracted {len(hindi_text)} characters")
         logger.info(f"First 200 chars of Hindi text: {hindi_text[:200]}...")
 
-        
+        # Extract section numbers from the raw Hindi text BEFORE translation
+        # so numerals embedded in Devanagari context are not lost during translation.
+        hindi_sections = legal_engine.extract_sections_from_hindi(hindi_text)
+        logger.info(f"Sections found in Hindi text pre-translation: {hindi_sections}")
+
         english_text = await translation_service.translate_to_english(hindi_text)
         
         
@@ -64,7 +68,12 @@ async def analyze_case_file_rag(file: UploadFile = File(...)):
         await rag_service.store_case_data(english_text, case_id)
         
         try:
-            ai_result = await legal_engine.analyze_legal_case(case_id)
+            ai_result = await legal_engine.analyze_legal_case(
+                case_id,
+                raw_english_text=english_text,
+                hint_sections=hindi_sections,
+                raw_hindi_text=hindi_text
+            )
         except RuntimeError as e:
             # Catch CUDA out of memory errors
             if "out of memory" in str(e).lower() or "cuda" in str(e).lower():

@@ -149,7 +149,7 @@ def analyze_case(uploaded_file, api_url):
         response = requests.post(
             f"{api_url}/api/v1/analyze-case-rag",
             files=files,
-            timeout=1200  
+            timeout=1500  
         )
         
         progress_bar.progress(90)
@@ -183,7 +183,7 @@ def analyze_case(uploaded_file, api_url):
         progress_bar.empty()
         status_text.empty()
         st.markdown('''<div class="error-box">
-            ⏱️ <strong>Timeout Error:</strong> The analysis is taking longer than expected (>20 minutes).<br>
+            ⏱️ <strong>Timeout Error:</strong> The analysis is taking longer than expected (>25 minutes).<br>
             <strong>What's happening:</strong> The backend is still processing your request, but the frontend stopped waiting.<br>
             <strong>Suggestions:</strong>
             <ul>

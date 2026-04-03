@@ -12,7 +12,7 @@ USE_GPU = os.getenv("TRANSLATION_USE_GPU", "true").lower() == "true"
 DEVICE = "cuda" if (torch.cuda.is_available() and USE_GPU) else "cpu"
 
 print(f"Translation service will use: {DEVICE.upper()}")
-print(f"Translation model: {MODEL_NAME} (local cache only)")
+print(f"Translation model: {MODEL_NAME}")
 
 tokenizer = None
 model = None
@@ -26,13 +26,11 @@ def load_model():
 
         tokenizer = AutoTokenizer.from_pretrained(
             MODEL_NAME,
-            local_files_only=True,
             trust_remote_code=True,
         )
 
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
-            local_files_only=True,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32,
         ).to(DEVICE)

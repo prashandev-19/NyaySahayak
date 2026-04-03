@@ -17,7 +17,7 @@ model_dir.mkdir(parents=True, exist_ok=True)
 print("Initializing EasyOCR on CPU to preserve GPU memory for legal analysis...")
 reader = easyocr.Reader(
     ['hi', 'en'], 
-    gpu=False,  
+    gpu=True,  
     model_storage_directory=str(model_dir),
     user_network_directory=str(model_dir)
 )

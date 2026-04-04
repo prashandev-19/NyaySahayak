@@ -2,12 +2,24 @@ from app.routers import analysis
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import os
 from app.services.legal_engine import load_reasoning_model
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("System Startup: Pre-loading AI Models...")
-    load_reasoning_model() 
+    preload_on_startup = os.getenv("PRELOAD_REASONING_MODEL", "false").lower() == "true"
+    print("System Startup")
+    if preload_on_startup:
+        print("Pre-loading reasoning model (PRELOAD_REASONING_MODEL=true)...")
+        try:
+            load_reasoning_model()
+            print("Reasoning model preloaded successfully")
+        except Exception as e:
+            # Keep API available even if preload fails; model will lazy-load on demand.
+            print(f"Reasoning model preload failed: {e}")
+            print("Continuing startup with lazy model loading")
+    else:
+        print("Skipping model preload; reasoning model will load on first analysis request")
     yield
     print("System Shutdown")
 

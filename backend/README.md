@@ -59,6 +59,46 @@ ADAPTER_PATH=D:\path\to\your\adapter\checkpoint-xxxx
 
 # Optional (Windows PDF support)
 POPPLER_PATH=C:\path\to\poppler-xx\Library\bin
+
+# Optional
+# auto (default): use GPU when available and VRAM threshold is met, else CPU
+# true: force GPU attempt, false: always CPU
+TRANSLATION_USE_GPU=auto
+
+# Optional (used when TRANSLATION_USE_GPU=true or auto)
+# Translation switches to CPU if detected VRAM is below this threshold.
+TRANSLATION_MIN_GPU_VRAM_GB=6
+
+# Optional memory safety flag
+# false (default): unload translation model after each request to free VRAM for legal analysis
+# true: keep the translation model resident between requests
+TRANSLATION_KEEP_MODEL_RESIDENT=false
+
+# Translation does not auto-fallback to CPU on GPU OOM; it fails fast instead.
+
+# Optional translation speed/quality knobs
+# Lower max tokens improves speed; increase if outputs are cut short.
+TRANSLATION_MAX_NEW_TOKENS=128
+# Bigger chunk size reduces number of model calls for long FIRs.
+TRANSLATION_MAX_CHUNK_SIZE=700
+# Cache repeated translations/chunks to speed up iterative testing.
+TRANSLATION_CACHE_ITEMS=128
+
+# Optional startup behavior
+# false (recommended): backend starts immediately; legal model lazy-loads on first analysis request
+# true: preload legal model during startup (can take long and block API readiness)
+PRELOAD_REASONING_MODEL=false
+
+# Optional legal engine memory optimization (for CPU-only systems)
+# true (default): use 8-bit quantization for CPU mode (fits in ~8GB)
+# false: disable quantization (requires ~32GB RAM, may fail)
+LEGAL_ENGINE_8BIT_CPU=true
+
+# Optional: skip fine-tuned adapter loading for faster startup (base model only, lower quality)
+LEGAL_ENGINE_SKIP_ADAPTER=false
+
+# Optional: force legal engine to use GPU only (no CPU fallback)
+LEGAL_ENGINE_REQUIRE_GPU=true
 ```
 
 **Get HuggingFace Token:**
@@ -156,6 +196,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 - Reduce batch size in code
 - Use smaller model variant
 - Enable CPU offloading
+- Set `TRANSLATION_USE_GPU=false` on 8GB GPUs if the legal model is also using CUDA
 
 ---
 

@@ -42,6 +42,14 @@ async def analyze_case_file_rag(file: UploadFile = File(...)):
         
         if english_text.startswith("Error"):
             logger.error(f"Translation Error: {english_text}")
+            if "out of memory" in english_text.lower() or "cuda" in english_text.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Translation model is temporarily out of GPU memory. "
+                        "Please retry in a few moments."
+                    ),
+                )
             raise HTTPException(status_code=500, detail=english_text)
         
         logger.info(f"Translation produced {len(english_text)} characters")

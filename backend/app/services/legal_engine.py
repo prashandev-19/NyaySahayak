@@ -5,6 +5,7 @@ import os
 import json
 import time
 import re
+import psutil
 from dotenv import load_dotenv
 from app.services import rag_service
 from fastapi.concurrency import run_in_threadpool
@@ -20,6 +21,11 @@ BASE_MODEL_ID = "meta-llama/Meta-Llama-3-8B"
 ADAPTER_ID = os.getenv("ADAPTER_PATH")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
+# Memory optimization flags
+USE_8BIT_CPU = os.getenv("LEGAL_ENGINE_8BIT_CPU", "true").lower() == "true"
+SKIP_ADAPTER_LOAD = os.getenv("LEGAL_ENGINE_SKIP_ADAPTER", "false").lower() == "true"
+REQUIRE_GPU = os.getenv("LEGAL_ENGINE_REQUIRE_GPU", "true").lower() == "true"
+
 tokenizer = None
 model = None
 
@@ -33,12 +39,22 @@ def load_reasoning_model():
         # Enhanced GPU detection
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Detected Hardware: {device.upper()}")
+
+        if REQUIRE_GPU and device != "cuda":
+            raise RuntimeError(
+                "LEGAL_ENGINE_REQUIRE_GPU=true and no CUDA GPU is available. "
+                "CPU fallback is disabled."
+            )
         
         if device == "cuda":
             print(f"GPU Found: {torch.cuda.get_device_name(0)}")
             print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
             print(f"PyTorch: {torch.__version__}")
         else:
+            # Log available system RAM
+            available_ram_gb = psutil.virtual_memory().available / (1024**3)
+            total_ram_gb = psutil.virtual_memory().total / (1024**3)
+            print(f"Available RAM: {available_ram_gb:.2f} GB / {total_ram_gb:.2f} GB")
             print(f"PyTorch Version: {torch.__version__}")
             print(f"CUDA Built: {torch.version.cuda if torch.version.cuda else 'No'}")
 
@@ -78,30 +94,42 @@ def load_reasoning_model():
                     BASE_MODEL_ID,
                     token=HF_TOKEN,
                     quantization_config=bnb_config,
-                    device_map="auto",
-                    trust_remote_code=True
+                    device_map={"": 0},
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
                 )
                 print("Model loaded on GPU with 4-bit quantization")
             else:
-                print("No GPU detected. Loading in Standard CPU Mode.")
-                print("Note: This will be slow and consume significant RAM.")
-                
-                base_model = AutoModelForCausalLM.from_pretrained(
-                    BASE_MODEL_ID,
-                    token=HF_TOKEN,
-                    device_map="cpu",
-                    torch_dtype=torch.float32 
+                raise RuntimeError(
+                    "CUDA GPU is required for legal model loading. CPU fallback is disabled."
                 )
 
             print(f"Attaching Adapter: {ADAPTER_ID}...")
-            model = PeftModel.from_pretrained(
-                base_model,
-                ADAPTER_ID,
-                token=HF_TOKEN
-            )
+            if SKIP_ADAPTER_LOAD:
+                print("LEGAL_ENGINE_SKIP_ADAPTER=true: Skipping adapter load.")
+                model = base_model
+            else:
+                model = PeftModel.from_pretrained(
+                    base_model,
+                    ADAPTER_ID,
+                    token=HF_TOKEN
+                )
             
-            print("FactLegalLlama Adapter Loaded Successfully!")
+            print("FactLegalLlama Model Loaded Successfully!")
             
+        except RuntimeError as e:
+            if "not enough memory" in str(e).lower():
+                print("\n" + "="*80)
+                print("MEMORY ERROR: Model cannot fit in available RAM/VRAM!")
+                print("="*80)
+                print("\nTroubleshooting Steps:")
+                print("  1. Keep LEGAL_ENGINE_REQUIRE_GPU=true in .env")
+                print("  2. Ensure backend uses CUDA-enabled PyTorch and visible NVIDIA GPU")
+                print("  3. Close other GPU processes to free VRAM")
+                print("  4. Keep using the same model and retry")
+                print("="*80)
+            raise e
         except Exception as e:
             print(f"Error loading model: {e}")
             raise e

@@ -149,7 +149,7 @@ def analyze_case(uploaded_file, api_url):
         response = requests.post(
             f"{api_url}/api/v1/analyze-case-rag",
             files=files,
-            timeout=18000
+            timeout=432000
         )
         
         progress_bar.progress(90)

@@ -43,13 +43,8 @@ pip install -r requirements.txt
 
 **For Intel Arc GPU users:**
 ```bash
-# Optional: only for supported Python/OS combinations (typically Python 3.10/3.11)
 pip install intel-extension-for-pytorch
 ```
-
-If this fails with `No matching distribution found`, skip this package and continue.
-The backend can still run without it (CPU/CUDA paths). Intel Arc users should use a
-Python version with published wheels (3.10 or 3.11 are recommended).
 
 ### 4. Configure Environment Variables
 

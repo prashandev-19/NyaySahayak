@@ -471,9 +471,9 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
         all_chunks = []
         for query in queries:
             chunks = await rag_service.get_relevant_context(
-                query=query, 
+                query=query,
                 filter={"case_id": case_id},
-                top_k=3  
+                top_k=6
             )
             all_chunks.extend(chunks)
         
@@ -493,9 +493,9 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
    
     full_context_cleaned = clean_ocr_text(full_context)
     
-    formatted_context = full_context_cleaned[:4000]
-    if len(full_context_cleaned) > 4000:
-        print(f"Context truncated from {len(full_context_cleaned)} to 4000 chars to fit GPU memory")
+    formatted_context = full_context_cleaned[:7000]
+    if len(full_context_cleaned) > 7000:
+        print(f"Context truncated from {len(full_context_cleaned)} to 7000 chars to fit GPU memory")
     
     print("[2.1/4] Pre-extracting IPC/BNS sections from case document...")
 
@@ -595,10 +595,10 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
         
         if statute_chunks:
             raw_statutes = "\n\n".join(statute_chunks)
-           
-            formatted_statutes = raw_statutes[:1500]
-            if len(raw_statutes) > 1500:
-                print(f"Statutes truncated from {len(raw_statutes)} to 1500 chars")
+
+            formatted_statutes = raw_statutes[:2500]
+            if len(raw_statutes) > 2500:
+                print(f"Statutes truncated from {len(raw_statutes)} to 2500 chars")
             print(f"Retrieved {len(statute_chunks)} relevant statute sections ({time.time() - statute_start:.2f}s)")
             print(f"  - First 200 chars of statutes:")
             print(f"    {formatted_statutes[:200]}...")
@@ -733,9 +733,9 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
             ctx, re.IGNORECASE
         )
         if label_m:
-            best = label_m.group(1).strip()[:800]
+            best = label_m.group(1).strip()[:1400]
             opener = f"An FIR was registered against {acc} on the complaint of {comp}. "
-            return (opener + best)[:900]
+            return (opener + best)[:1500]
 
         
         incident_kw = re.compile(
@@ -756,16 +756,14 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
         incident_scored.sort(key=lambda x: x[1], reverse=True)
 
         if incident_scored and incident_scored[0][1] > 0:
-            best = incident_scored[0][0][:800]
+            best = incident_scored[0][0][:1400]
         elif body_paras:
-            
-            best = sorted(body_paras, key=len, reverse=True)[0][:800]
+            best = sorted(body_paras, key=len, reverse=True)[0][:1400]
         else:
-            
-            best = ctx[:800]
+            best = ctx[:1400]
 
         opener = f"An FIR was registered against {acc} on the complaint of {comp}. "
-        return (opener + best)[:900]
+        return (opener + best)[:1500]
 
     facts_narrative = _build_facts_narrative(formatted_context, _comp_hint, _acc_hint, sections_str)
 
@@ -804,7 +802,7 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
         f"{EXAMPLE_BLOCK}"
         f"Case Name: {case_name_line}\n\n"
         f"Text: FIR analysis. Sections invoked: {sections_str}. "
-        f"Relevant statutes: {formatted_statutes[:300]}\n\n"
+        f"Relevant statutes: {formatted_statutes[:800]}\n\n"
         f"Facts: {masked_facts}\n\n"
         f"Issue: Whether [ACCUSED_NAME] is criminally liable under IPC/BNS Sections "
         f"{sections_str} as alleged in the FIR filed by [COMPLAINANT_NAME], and what "
@@ -823,7 +821,7 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
         raw_prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=3000,
+        max_length=5500,
         padding=False
     )
     input_ids = encoded.input_ids.to(model_instance.device)
@@ -846,8 +844,8 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
             return model_instance.generate(
                 input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=600,        
-                do_sample=False,            
+                max_new_tokens=800,
+                do_sample=False,
                 pad_token_id=tokenizer_instance.pad_token_id,
                 eos_token_id=terminators,
                 repetition_penalty=1.05,    
@@ -862,8 +860,8 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
             print(f"Freeing tensors and retrying with minimal context.\n")
             
             import gc
-            saved_ids_cpu = input_ids[:, -2000:].cpu()  
-            saved_mask_cpu = attention_mask[:, -2000:].cpu()
+            saved_ids_cpu = input_ids[:, -3500:].cpu()
+            saved_mask_cpu = attention_mask[:, -3500:].cpu()
             del input_ids
             del attention_mask
             

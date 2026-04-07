@@ -47,9 +47,9 @@ async def store_case_data(full_text: str, case_id: str):
         print(f"Full text length: {len(full_text)} characters")
         
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1200,  
-            chunk_overlap=250,  
-            separators=["\n\n", "\n", ". ", " ", ""],  
+            chunk_size=2500,
+            chunk_overlap=500,
+            separators=["\n\n", "\n", ". ", " ", ""],
             length_function=len,
         )
         

@@ -6,13 +6,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
-
 MODEL_NAME = "sarvamai/sarvam-translate"
 USE_GPU = os.getenv("TRANSLATION_USE_GPU", "true").lower() == "true"
 DEVICE = "cuda" if (torch.cuda.is_available() and USE_GPU) else "cpu"
 
 print(f"Translation service will use: {DEVICE.upper()}")
-print(f"Translation model: {MODEL_NAME}")
+print(f"Translation model: {MODEL_NAME} (local cache only)")
 
 tokenizer = None
 model = None
@@ -26,11 +25,13 @@ def load_model():
 
         tokenizer = AutoTokenizer.from_pretrained(
             MODEL_NAME,
+            local_files_only=True,
             trust_remote_code=True,
         )
 
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
+            local_files_only=True,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32,
         ).to(DEVICE)
@@ -93,7 +94,7 @@ async def translate_to_english(hindi_text: str) -> str:
 
         tok, mdl = load_model()
 
-        MAX_CHUNK_SIZE = 400  # characters per chunk
+        MAX_CHUNK_SIZE = 700  # characters per chunk
 
         def smart_split(text, max_size):
             if len(text) <= max_size:

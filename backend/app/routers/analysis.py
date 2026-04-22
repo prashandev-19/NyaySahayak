@@ -86,6 +86,7 @@ async def analyze_case_file_rag(file: UploadFile = File(...)):
                     case_id=case_id,
                     summary="GPU memory exhausted. Please try again in a moment.",
                     offenses=["Analysis pending due to system resource constraints"],
+                    sections=[],
                     missing_evidence=["Analysis could not be completed"],
                     recommendation="The system is currently processing other requests. Please retry your analysis in 30 seconds. If the issue persists, contact system administrator."
                 )
@@ -98,6 +99,7 @@ async def analyze_case_file_rag(file: UploadFile = File(...)):
                 case_id=case_id,
                 summary="Error in AI Analysis",
                 offenses=[],
+                sections=[],
                 missing_evidence=[],
                 recommendation=f"System Error: {ai_result.get('error')}",
                 summary_hindi=None,
@@ -107,6 +109,7 @@ async def analyze_case_file_rag(file: UploadFile = File(...)):
 
         summary_en = ai_result.get("summary", "No summary provided.")
         offenses_en = ai_result.get("offenses", [])
+        sections_en = ai_result.get("sections", [])
         missing_evidence_en = ai_result.get("missing_evidence", [])
 
         # Best-effort Hindi rendering for frontend bilingual display.
@@ -136,6 +139,7 @@ async def analyze_case_file_rag(file: UploadFile = File(...)):
             case_id=case_id,
             summary=summary_en,
             offenses=offenses_en,
+            sections=sections_en,
             missing_evidence=missing_evidence_en,
             recommendation=ai_result.get("recommendation", "No recommendation provided."),
             summary_hindi=summary_hi,

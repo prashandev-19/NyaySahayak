@@ -27,6 +27,47 @@ LEGAL_CHUNK_OVERLAP_CHARS = int(os.getenv("LEGAL_CHUNK_OVERLAP_CHARS", "200"))
 LEGAL_CONTEXT_CHAR_BUDGET = int(os.getenv("LEGAL_CONTEXT_CHAR_BUDGET", "7000"))
 LEGAL_USE_PROMPT_EXAMPLES = os.getenv("LEGAL_USE_PROMPT_EXAMPLES", "false").lower() == "true"
 
+
+def _get_env_float(name: str, default: float, min_value: float = None, max_value: float = None) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"Invalid {name}='{raw}', using default {default}")
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def _get_env_int(name: str, default: int, min_value: int = None, max_value: int = None) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"Invalid {name}='{raw}', using default {default}")
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+# Decoding controls for response diversity while keeping legal grounding.
+LEGAL_GEN_TEMPERATURE = _get_env_float("LEGAL_GEN_TEMPERATURE", 1.0, 0.1, 1.5)
+LEGAL_GEN_TOP_P = _get_env_float("LEGAL_GEN_TOP_P", 0.92, 0.1, 1.0)
+LEGAL_GEN_TOP_K = _get_env_int("LEGAL_GEN_TOP_K", 50, 1, 200)
+LEGAL_GEN_MAX_NEW_TOKENS = _get_env_int("LEGAL_GEN_MAX_NEW_TOKENS", 1200, 200, 1600)
+LEGAL_GEN_REPETITION_PENALTY = _get_env_float("LEGAL_GEN_REPETITION_PENALTY", 1.08, 1.0, 2.0)
+LEGAL_GEN_NO_REPEAT_NGRAM = _get_env_int("LEGAL_GEN_NO_REPEAT_NGRAM", 4, 0, 8)
+
 tokenizer = None
 model = None
 
@@ -117,6 +158,46 @@ def load_reasoning_model():
 
 # Devanagari numerals map for section extraction
 _DEVA_DIGIT = str.maketrans('०१२३४५६७८९', '0123456789')
+_SECTION_ACT_PATTERN = r'(?:IPC|I\.?P\.?C\.?|BNS|BNSS|B\.?N\.?S\.?S?\.?)'
+
+
+def normalize_section_token(raw_sec: str) -> str:
+    """
+    Normalize section references from OCR-heavy text.
+
+    Examples:
+    - "120-B" -> "120B"
+    - "१०३(1)" -> "103(1)"
+    - " 379 " -> "379"
+    """
+    if not raw_sec:
+        return ""
+
+    sec = str(raw_sec).translate(_DEVA_DIGIT).upper().strip()
+    sec = sec.replace(" ", "")
+    sec = sec.replace("–", "-").replace("—", "-")
+    sec = re.sub(r"[\.,;:]+$", "", sec)
+    sec = re.sub(r'(?<=\d)[-/](?=[A-Z])', '', sec)
+
+    m = re.match(r'^(\d{1,4})([A-Z])?(?:\(([A-Z0-9]+)\))?$', sec)
+    if not m:
+        return ""
+
+    base_num = int(m.group(1))
+    if base_num <= 0 or base_num > 999:
+        return ""
+
+    normalized = m.group(1)
+    if m.group(2):
+        normalized += m.group(2)
+    if m.group(3):
+        normalized += f"({m.group(3)})"
+    return normalized
+
+
+def _section_sort_key(sec: str):
+    m = re.match(r'^(\d+)', sec or "")
+    return (int(m.group(1)) if m else 10**9, sec or "")
 
 def extract_sections_from_hindi(hindi_text: str) -> list:
     """
@@ -128,22 +209,22 @@ def extract_sections_from_hindi(hindi_text: str) -> list:
     hindi_normalized = hindi_text.translate(_DEVA_DIGIT)
 
     patterns = [
-        # धारा 302, धारा 376(क)
-        r'धारा\s*([\d]+(?:\([a-zA-Z0-9]+\))?)',
-        # u/s 302, U/S 376
-        r'[Uu]/[Ss]\s*([\d]{2,3}(?:\([a-zA-Z0-9]+\))?)',
-        # Section 302 IPC / BNS
-        r'(?:Section|Sec\.?)\s+([\d]{2,3}(?:\([a-zA-Z0-9]+\))?)',
-        # bare numbers followed by IPC/BNS
-        r'([\d]{2,3})\s+(?:IPC|BNS|आईपीसी)',
+        # धारा 302, धारा 376(क), धारा 120-B
+        r'धारा\s*([\d]{1,4}(?:\s*[-/]?\s*[A-Za-z])?(?:\s*\([a-zA-Z0-9]+\))?)',
+        # u/s 302, U/S 376, u/s 120-B
+        r'[Uu]/[Ss]\s*([\d]{1,4}(?:\s*[-/]?\s*[A-Za-z])?(?:\s*\([a-zA-Z0-9]+\))?)',
+        # Section 302 IPC / BNS / BNSS (with optional dotted OCR forms)
+        rf'(?:Section|Sec\.?)\s*([\d]{{1,4}}(?:\s*[-/]?\s*[A-Za-z])?(?:\s*\([a-zA-Z0-9]+\))?)\s*(?:{_SECTION_ACT_PATTERN})?',
+        # bare numbers followed by IPC/BNS token
+        rf'([\d]{{1,4}}(?:\s*[-/]?\s*[A-Za-z])?(?:\s*\([a-zA-Z0-9]+\))?)\s*(?:{_SECTION_ACT_PATTERN}|आईपीसी)',
     ]
     found = set()
     for pat in patterns:
         for m in re.finditer(pat, hindi_normalized, re.IGNORECASE):
-            sec = re.sub(r'\s+', '', m.group(1).strip())
-            if sec and (sec.isdigit() or re.match(r'^\d+\([a-zA-Z0-9]+\)$', sec)):
+            sec = normalize_section_token(m.group(1).strip())
+            if sec:
                 found.add(sec)
-    result = sorted(found, key=lambda x: int(re.match(r'\d+', x).group()))
+    result = sorted(found, key=_section_sort_key)
     if result:
         print(f"Pre-translation Hindi section extraction: {result}")
     return result
@@ -648,43 +729,60 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
     }
 
     section_patterns = [
-        # Only match sections explicitly tagged with IPC/BNS
-        r'(?:Section|Sec\.?|धारा)\s+([\d]+(?:\s*[/-]\s*[\d]+)*(?:\s*\([a-zA-Z0-9]+\))?)\s+(?:IPC|BNS|of\s+IPC|of\s+BNS)',
-        r'(?:IPC|BNS)\s+(?:Section|Sec\.?|धारा)\s+([\d]+(?:\s*[/-]\s*[\d]+)*(?:\s*\([a-zA-Z0-9]+\))?)',
-        r'(?:under|u/s|U/S)\s+(?:Section|Sec\.?)?\s*([\d]+(?:\s*[/-]\s*[\d]+)*(?:\s*\([a-zA-Z0-9]+\))?)\s+(?:IPC|BNS)',
-        r'(\d{2,3}(?:\s*\([a-zA-Z0-9]+\))?)\s+(?:IPC|BNS)',
-        r'(?:Sections?|Sec\.?)\s+([\d]+(?:\s*,\s*[\d]+)*(?:\s*,?\s*and\s+[\d]+)?)\s+(?:of\s+)?(?:IPC|BNS)',
+        # Only match sections explicitly tagged with IPC/BNS/BNSS (including OCR dotted forms)
+        rf'(?:Section|Sec\.?|धारा)\s+([\dA-Za-z()\s,/-]+?)\s+(?:{_SECTION_ACT_PATTERN}|of\s+{_SECTION_ACT_PATTERN})',
+        rf'(?:{_SECTION_ACT_PATTERN})\s+(?:Section|Sec\.?|धारा)\s+([\dA-Za-z()\s,/-]+)',
+        rf'(?:under|u/s|U/S)\s+(?:Section|Sec\.?)?\s*([\dA-Za-z()\s,/-]+?)\s+(?:{_SECTION_ACT_PATTERN})',
+        rf'(\d{{1,4}}(?:\s*[-/]?\s*[A-Za-z])?(?:\s*\([a-zA-Z0-9]+\))?)\s+(?:{_SECTION_ACT_PATTERN})',
     ]
-    
+
     eng_extracted_sections = set()
     for pattern in section_patterns:
         matches = re.findall(pattern, full_context_cleaned, re.IGNORECASE)
         for match in matches:
-            section_parts = re.split(r'[,\s]+(?:and\s+)?', match)
-            for part in section_parts:
-                section_num = re.sub(r'\s+', '', part.strip())
-                if section_num and (section_num.isdigit() or re.match(r'^\d+\([a-zA-Z0-9]+\)$', section_num)):
+            candidate_blob = match if isinstance(match, str) else "".join(match)
+            token_candidates = re.findall(
+                r'\d{1,4}(?:\s*[-/]?\s*[A-Za-z])?(?:\s*\([a-zA-Z0-9]+\))?',
+                candidate_blob,
+                flags=re.IGNORECASE,
+            )
+            if not token_candidates:
+                token_candidates = [candidate_blob]
+
+            for token in token_candidates:
+                section_num = normalize_section_token(token)
+                if section_num:
                     eng_extracted_sections.add(section_num)
-    
-   
-    if hint_sections and len(hint_sections) >= 2:
-        pre_extracted_sections = set(hint_sections)
-        
+
+    normalized_hint_sections = []
+    for sec in hint_sections or []:
+        normalized = normalize_section_token(str(sec))
+        if normalized and normalized not in normalized_hint_sections:
+            normalized_hint_sections.append(normalized)
+
+    if normalized_hint_sections and len(normalized_hint_sections) >= 2:
+        pre_extracted_sections = set(normalized_hint_sections)
+
         for sec in eng_extracted_sections:
             base = re.match(r'\d+', sec)
             if base and int(base.group()) >= 30 and sec not in _PROCEDURAL_SECTIONS:
                 pre_extracted_sections.add(sec)
-        print(f"Using Hindi sections as primary: {hint_sections}")
-        print(f"Added {len(pre_extracted_sections) - len(hint_sections)} valid English sections")
+        print(f"Using Hindi sections as primary: {normalized_hint_sections}")
+        print(f"Added {len(pre_extracted_sections) - len(normalized_hint_sections)} valid English sections")
     else:
-        pre_extracted_sections = eng_extracted_sections
-        if hint_sections:
-            pre_extracted_sections.update(hint_sections)
+        pre_extracted_sections = set(eng_extracted_sections)
+        if normalized_hint_sections:
+            pre_extracted_sections.update(normalized_hint_sections)
 
-    
-    pre_extracted_sections -= _PROCEDURAL_SECTIONS
+    filtered_sections = set()
+    for sec in pre_extracted_sections:
+        base_match = re.match(r'\d+', sec)
+        base = base_match.group(0) if base_match else sec
+        if base in _PROCEDURAL_SECTIONS:
+            continue
+        filtered_sections.add(sec)
 
-    pre_extracted_list = sorted(list(pre_extracted_sections), key=lambda x: int(re.match(r'\d+', x).group()) if re.match(r'\d+', x) else 0)
+    pre_extracted_list = sorted(list(filtered_sections), key=_section_sort_key)
     print(f"Pre-extracted {len(pre_extracted_list)} IPC/BNS sections (filtered): {pre_extracted_list}")
     
   
@@ -929,6 +1027,13 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
     masked_comp = "[COMPLAINANT_NAME]"
     masked_acc  = "[ACCUSED_NAME]"
 
+    style_variants = [
+        "Use concise judicial prose with varied sentence openings and avoid repeating stock phrases.",
+        "Use factual, chronological narration first, then legal reasoning grounded in source material.",
+        "Use short analytical paragraphs and avoid reusing the same sentence stem across sections.",
+    ]
+    style_hint = style_variants[sum(ord(ch) for ch in case_id) % len(style_variants)]
+
     
     def _build_petitioner_args(ctx: str, comp: str, acc: str, secs: str) -> str:
         """Extract specific allegations from context for the petitioner arguments slot."""
@@ -954,6 +1059,7 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
 
     raw_prompt = (
         f"{STRICT_GROUNDING_RULES}\n\n"
+        f"WRITING STYLE: {style_hint}\n"
         f"{EXAMPLE_BLOCK}"
         f"Case Name: {case_name_line}\n\n"
         f"Text: FIR analysis. Sections invoked: {sections_str}. "
@@ -966,6 +1072,15 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
         f"Arguments of Respondent: The accused's exact role and motive are yet to be "
         f"fully established during investigation. The accused denies the allegations "
         f"and the investigation is ongoing.\n\n"
+        f"OUTPUT FORMAT (STRICT):\n"
+        f"Summary: <4-6 factual sentences>\n"
+        f"Reasoning: <source-grounded legal analysis>\n"
+        f"Decision: <clear recommendation/disposition>\n"
+        f"Evidence Gaps:\n"
+        f"- <gap 1>\n"
+        f"- <gap 2>\n"
+        f"- <gap 3>\n"
+        f"If no grounded evidence gap exists, write exactly one bullet: '- Not clearly mentioned in source.'\n\n"
         f"Summary:"
     )
 
@@ -987,6 +1102,31 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
     # 4. Run Inference in Threadpool (to avoid blocking FastAPI)
     print("[4/4] Running AI inference (this may take 30-120 seconds)...")
     print("Generating legal analysis...")
+
+    # Keep temperature near 1.0 if configured, but tighten nucleus/sampling
+    # controls so outputs stay source-grounded and less hallucinatory.
+    decode_temp = LEGAL_GEN_TEMPERATURE
+    decode_top_p = LEGAL_GEN_TOP_P
+    decode_top_k = LEGAL_GEN_TOP_K
+    decode_rep_penalty = LEGAL_GEN_REPETITION_PENALTY
+    decode_no_repeat_ngram = LEGAL_GEN_NO_REPEAT_NGRAM
+
+    if decode_temp >= 0.95:
+        decode_top_p = min(decode_top_p, 0.88)
+        decode_top_k = min(decode_top_k, 40)
+        decode_rep_penalty = max(decode_rep_penalty, 1.10)
+        decode_no_repeat_ngram = max(decode_no_repeat_ngram, 5)
+        print(
+            "High-temperature guardrail active: "
+            f"temp={decode_temp}, top_p={decode_top_p}, top_k={decode_top_k}, "
+            f"repetition_penalty={decode_rep_penalty}, no_repeat_ngram={decode_no_repeat_ngram}"
+        )
+
+    print(
+        f"Decoding params: temp={decode_temp}, top_p={decode_top_p}, "
+        f"top_k={decode_top_k}, no_repeat_ngram={decode_no_repeat_ngram}, "
+        f"repetition_penalty={decode_rep_penalty}"
+    )
     inference_start = time.time()
     
     _eot_id = tokenizer_instance.convert_tokens_to_ids("<|eot_id|>")
@@ -999,11 +1139,15 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
             return model_instance.generate(
                 input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=800,
-                do_sample=False,
+                max_new_tokens=LEGAL_GEN_MAX_NEW_TOKENS,
+                do_sample=True,
+                temperature=decode_temp,
+                top_p=decode_top_p,
+                top_k=decode_top_k,
                 pad_token_id=tokenizer_instance.pad_token_id,
                 eos_token_id=terminators,
-                repetition_penalty=1.05,    
+                repetition_penalty=decode_rep_penalty,
+                no_repeat_ngram_size=decode_no_repeat_ngram,
                 use_cache=True
             )
 
@@ -1033,15 +1177,29 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
             attention_mask_retry = saved_mask_cpu.to(model_instance.device)
             del saved_ids_cpu, saved_mask_cpu
             
-            print(f"Retrying with {input_ids_retry.shape[1]} tokens, max_new_tokens=300...")
+            print(
+                f"Retrying with {input_ids_retry.shape[1]} tokens, "
+                f"max_new_tokens={min(500, LEGAL_GEN_MAX_NEW_TOKENS)}..."
+            )
+
+            retry_temp = max(0.8, decode_temp - 0.15)
+            retry_top_p = min(0.85, decode_top_p)
+            retry_top_k = min(35, decode_top_k)
+            retry_rep_penalty = max(1.12, decode_rep_penalty)
+            retry_no_repeat_ngram = max(5, decode_no_repeat_ngram)
+
             outputs = await run_in_threadpool(lambda: model_instance.generate(
                 input_ids_retry,
                 attention_mask=attention_mask_retry,
-                max_new_tokens=500,
-                do_sample=False,
+                max_new_tokens=min(500, LEGAL_GEN_MAX_NEW_TOKENS),
+                do_sample=True,
+                temperature=retry_temp,
+                top_p=retry_top_p,
+                top_k=retry_top_k,
                 pad_token_id=tokenizer_instance.pad_token_id,
                 eos_token_id=terminators,
-                repetition_penalty=1.05,
+                repetition_penalty=retry_rep_penalty,
+                no_repeat_ngram_size=retry_no_repeat_ngram,
                 use_cache=False
             ))
            
@@ -1073,6 +1231,11 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
         print(f"GPU cache cleared. Available memory: {free_mem:.2f} GB")
     
     print(f"Generated {generated_tokens} tokens")
+    if generated_tokens >= (LEGAL_GEN_MAX_NEW_TOKENS - 5):
+        print(
+            "Warning: generation likely hit max_new_tokens cap; "
+            "increase LEGAL_GEN_MAX_NEW_TOKENS if outputs look incomplete."
+        )
 
     # 5. Parse model output (training-data Reasoning/Decision format)
     print("Parsing AI response...")
@@ -1098,7 +1261,7 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
 
     def extract_section_text(text: str, header: str) -> str:
         
-        pattern = rf'{re.escape(header)}\s*(.*?)(?=\n(?:Facts|Issue|Arguments of (?:Petitioner|Respondent)|Reasoning|Decision|Label)\s*:|$)'
+        pattern = rf'{re.escape(header)}\s*:?[ \t]*(.*?)(?=\n(?:Facts|Issue|Arguments of (?:Petitioner|Respondent)|Reasoning|Decision|Evidence\s+Gaps?|Missing\s+Evidence|Label)\s*:|$)'
         m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
         if m:
             return m.group(1).strip()
@@ -1124,6 +1287,7 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
             "447": "Criminal trespass", "448": "House-trespass",
             "454": "Lurking house-trespass", "457": "Lurking house-trespass by night",
             "34":  "Acts done by several persons in furtherance of common intention",
+            "109": "Abetment", "120": "Concealing design to commit offence",
             "120B": "Criminal conspiracy", "149": "Unlawful assembly",
             "341": "Wrongful restraint", "342": "Wrongful confinement",
             "343": "Wrongful confinement for three or more days",
@@ -1132,40 +1296,87 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
             "500": "Defamation", "506": "Criminal intimidation",
             "511": "Attempt to commit offence",
         }
-        
-        extra_sections = set(sections)
-        for pattern in [
-            r'Section\s+(\d{2,3}[A-Z]?(?:\([a-zA-Z0-9]+\))?)\s+(?:IPC|BNS)',
-            r'(?:under|u/s|U/S)\s+(\d{2,3}[A-Z]?)\s+(?:IPC|BNS)',
-        ]:
-            for m in re.finditer(pattern, reasoning_text, re.IGNORECASE):
-                extra_sections.add(m.group(1).strip())
-        
-        # Remove procedural sections — only keep recognized IPC offenses
-        extra_sections -= _PROCEDURAL_SECTIONS
+
+        def _extract_sections_from_text(text: str) -> set:
+            found = set()
+            if not text:
+                return found
+
+            patterns = [
+                rf'(?:Section|Sec\.?|धारा)\s+([\dA-Za-z()\s,/-]+?)\s+(?:{_SECTION_ACT_PATTERN}|of\s+{_SECTION_ACT_PATTERN})',
+                rf'(?:under|u/s|U/S)\s+(?:Section|Sec\.?)?\s*([\dA-Za-z()\s,/-]+?)\s+(?:{_SECTION_ACT_PATTERN})',
+                rf'(\d{{1,4}}(?:\s*[-/]?\s*[A-Za-z])?(?:\s*\([a-zA-Z0-9]+\))?)\s+(?:{_SECTION_ACT_PATTERN})',
+            ]
+
+            for pat in patterns:
+                for match in re.findall(pat, text, re.IGNORECASE):
+                    blob = match if isinstance(match, str) else "".join(match)
+                    candidates = re.findall(
+                        r'\d{1,4}(?:\s*[-/]?\s*[A-Za-z])?(?:\s*\([a-zA-Z0-9]+\))?',
+                        blob,
+                        flags=re.IGNORECASE,
+                    )
+                    if not candidates:
+                        candidates = [blob]
+
+                    for token in candidates:
+                        normalized = normalize_section_token(token)
+                        if normalized:
+                            found.add(normalized)
+
+            return found
+
+        normalized_input_sections = {
+            normalize_section_token(str(sec))
+            for sec in (sections or [])
+            if normalize_section_token(str(sec))
+        }
+        source_sections = _extract_sections_from_text(context)
+        merged_sections = set(normalized_input_sections) | set(source_sections)
+
+        filtered_sections = set()
+        for sec in merged_sections:
+            base_match = re.match(r'^\d+', sec)
+            base = base_match.group(0) if base_match else sec
+            if base in _PROCEDURAL_SECTIONS:
+                continue
+            filtered_sections.add(sec)
 
         offenses = []
-        for sec in sorted(extra_sections, key=lambda x: int(re.match(r'\d+', x).group()) if re.match(r'\d+', x) else 0):
+        for sec in sorted(filtered_sections, key=_section_sort_key)[:20]:
             desc = KNOWN_SECTIONS.get(sec)
-            if desc:
-                offenses.append(f"Section {sec} IPC - {desc}")
-            # Only include unknown sections if they have a description in reasoning
-            else:
-                m = re.search(rf'Section\s+{re.escape(sec)}\s+(?:IPC/BNS|IPC|BNS)\s*[\-\(]\s*([^\n)]+)', reasoning_text, re.IGNORECASE)
+            if not desc:
+                base_match = re.match(r'^(\d+)', sec)
+                if base_match:
+                    desc = KNOWN_SECTIONS.get(base_match.group(1))
+
+            if not desc:
+                m = re.search(
+                    rf'Section\s+{re.escape(sec)}\s+(?:IPC/BNS|IPC|BNS|BNSS)\s*[\-\(]\s*([^\n)]+)',
+                    (context or "") + "\n" + (reasoning_text or ""),
+                    re.IGNORECASE,
+                )
                 if m:
-                    offenses.append(f"Section {sec} IPC/BNS - {m.group(1).strip()[:60]}")
+                    desc = m.group(1).strip()[:70]
+
+            if desc:
+                offenses.append(f"Section {sec} IPC/BNS - {desc}")
+            else:
+                offenses.append(f"Section {sec} IPC/BNS - Referenced in source case file")
+
+        offenses = list(dict.fromkeys(offenses))
 
         if not offenses:
             # Keyword inference from context
             ctx_lower = context.lower()
             if 'theft' in ctx_lower or 'stolen' in ctx_lower:
-                offenses.append("Section 379 IPC - Theft")
+                offenses.append("Section 379 IPC/BNS - Theft")
             if 'assault' in ctx_lower or 'hurt' in ctx_lower or 'beat' in ctx_lower:
-                offenses.append("Section 323 IPC - Voluntarily causing hurt")
+                offenses.append("Section 323 IPC/BNS - Voluntarily causing hurt")
             if 'murder' in ctx_lower or 'killed' in ctx_lower:
-                offenses.append("Section 302 IPC - Murder")
+                offenses.append("Section 302 IPC/BNS - Murder")
             if 'cheating' in ctx_lower or 'fraud' in ctx_lower:
-                offenses.append("Section 420 IPC - Cheating")
+                offenses.append("Section 420 IPC/BNS - Cheating")
             if not offenses:
                 offenses.append("IPC/BNS sections to be determined after full investigation")
 
@@ -1175,89 +1386,342 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
         """Detect what evidence the FIR document already mentions as collected."""
         ctx_lower = context.lower()
         found = set()
+
+        def _is_negated(pattern: str) -> bool:
+            return bool(re.search(
+                rf'(?:no|none|without|missing|lack\s+of|absence\s+of)[^\n]{{0,40}}(?:{pattern})|'
+                rf'(?:{pattern})[^\n]{{0,40}}(?:not\s+(?:available|found|obtained|recovered|collected|proved)|missing|inconclusive|insufficient)',
+                ctx_lower,
+                re.IGNORECASE,
+            ))
+
         # MLC / medical report
-        if re.search(r'\bmlc\b|\bmedical\s+(?:report|examination|certificate)|medico.?legal', ctx_lower):
+        if re.search(r'\bmlc\b|\bmedical\s+(?:report|examination|certificate)|medico.?legal', ctx_lower) and not _is_negated(r'\bmlc\b|\bmedical\s+(?:report|examination|certificate)|medico.?legal'):
             found.add('mlc')
+
+        if re.search(r'post.?mortem|autopsy|pm\s*report', ctx_lower) and not _is_negated(r'post.?mortem|autopsy|pm\s*report'):
+            found.add('postmortem')
+
         # Site plan / scene inspection
-        if re.search(r'site\s+plan|scene\s+(?:of\s+crime\s+)?inspection|spot\s+map|naksha\s+mauka|mauqa', ctx_lower):
+        if re.search(r'site\s+plan|scene\s+(?:of\s+crime\s+)?inspection|spot\s+map|naksha\s+mauka|mauqa', ctx_lower) and not _is_negated(r'site\s+plan|scene\s+(?:of\s+crime\s+)?inspection|spot\s+map|naksha\s+mauka|mauqa'):
             found.add('site_plan')
         # Arrest memo
-        if re.search(r'arrest\s+memo|arrested|गिरफ्तारी', ctx_lower):
+        if re.search(r'arrest\s+memo|arrested|गिरफ्तारी', ctx_lower) and not _is_negated(r'arrest\s+memo|arrested|गिरफ्तारी'):
             found.add('arrest')
         # Seizure memo / recovery
-        if re.search(r'seizure\s+memo|recovered|baram[ae]d|जब्ती|बरामद', ctx_lower):
+        if re.search(r'seizure\s+memo|recovered|baram[ae]d|जब्ती|बरामद', ctx_lower) and not _is_negated(r'seizure\s+memo|recovered|baram[ae]d|जब्ती|बरामद'):
             found.add('seizure')
         # FIR copy
         if re.search(r'\bfir\b|\bf\.i\.r\.?', ctx_lower):
             found.add('fir')
         # Witness statements
-        if re.search(r'witness(?:es)?\s+statement|statement.*witness|161\s+cr\.?p\.?c|बयान', ctx_lower):
+        if re.search(r'witness(?:es)?\s+statement|statement.*witness|161\s+cr\.?p\.?c|बयान', ctx_lower) and not _is_negated(r'witness(?:es)?\s+statement|statement.*witness|161\s+cr\.?p\.?c|बयान'):
             found.add('witness_statements')
+
+        if re.search(r'victim\s+statement|statement\s+of\s+victim', ctx_lower) and not _is_negated(r'victim\s+statement|statement\s+of\s+victim'):
+            found.add('victim_statement')
+
         # CCTV
-        if re.search(r'\bcctv\b|\bcamera\b|\bfootage\b', ctx_lower):
+        if re.search(r'\bcctv\b|\bcamera\b|\bfootage\b', ctx_lower) and not _is_negated(r'\bcctv\b|\bcamera\b|\bfootage\b'):
             found.add('cctv')
         # FSL / forensic
-        if re.search(r'\bfsl\b|\bforensic\b|finger\s*print', ctx_lower):
+        if re.search(r'\bfsl\b|\bforensic\b|finger\s*print|ballistic', ctx_lower) and not _is_negated(r'\bfsl\b|\bforensic\b|finger\s*print|ballistic'):
             found.add('fsl')
         # Photographs
-        if re.search(r'photograph|photo', ctx_lower):
+        if re.search(r'photograph|photo|image', ctx_lower) and not _is_negated(r'photograph|photo|image'):
             found.add('photos')
         # CDR / call records
-        if re.search(r'\bcdr\b|call\s+detail|call\s+record', ctx_lower):
+        if re.search(r'\bcdr\b|call\s+detail|call\s+record', ctx_lower) and not _is_negated(r'\bcdr\b|call\s+detail|call\s+record'):
             found.add('cdr')
+
+        if re.search(r'ownership|owner|invoice|receipt|bill|documentary\s+proof', ctx_lower):
+            found.add('ownership_docs')
+
+        if re.search(r'motive|enmity|previous\s+dispute|land\s+dispute|grudge|rivalry', ctx_lower):
+            found.add('motive')
+
+        if re.search(r'\btip\b|test\s+identification\s+parade|identified\s+by', ctx_lower):
+            found.add('identification')
+
         return found
 
-    def extract_missing_evidence_from_reasoning(reasoning: str, context: str) -> list:
+    def extract_missing_evidence_from_reasoning(reasoning: str, context: str, sections: list) -> list:
         available = _detect_available_evidence(context)
-        print(f"Evidence already in document: {available}")
+        normalized_sections = []
+        for sec in sections or []:
+            normalized = normalize_section_token(str(sec))
+            if normalized and normalized not in normalized_sections:
+                normalized_sections.append(normalized)
 
-        def _tokenize_for_overlap(text: str) -> set:
+        print(f"Evidence already in document: {available}")
+        print(f"Sections used for evidence derivation: {normalized_sections}")
+
+        section_requirements = {
+            "302": [
+                "Final post-mortem report with cause of death",
+                "Witness statements",
+                "Forensic examination of weapon",
+                "Motive documentation",
+                "Scene photographs and site map",
+            ],
+            "307": [
+                "Injury certificate (MLC)",
+                "Witness statements",
+                "Weapon recovery",
+                "Forensic examination of weapon",
+            ],
+            "376": [
+                "Complete medical examination report (SANE kit)",
+                "Forensic analysis of SANE kit samples",
+                "Photo documentation of injuries",
+                "Detailed victim statement under Section 161 CrPC",
+                "Identification by victim before magistrate",
+            ],
+            "379": [
+                "Recovery of stolen property from accused",
+                "Identification of property ownership",
+                "Statement of eyewitness",
+            ],
+            "392": [
+                "Recovery of stolen property from accused",
+                "Identification by victim/witness",
+                "Weapon recovery",
+                "Witness statements",
+            ],
+            "325": [
+                "Injury certificate (MLC)",
+                "Witness statements",
+                "Photo documentation of injuries",
+            ],
+            "406": [
+                "Entrustment/transaction records",
+                "Recovery of entrusted property",
+                "Witness statements",
+            ],
+            "420": [
+                "Documentary proof of false representation",
+                "Proof of inducement and delivery",
+                "Victim statement",
+            ],
+            "447": [
+                "Ownership/possession proof",
+                "Site map and scene inspection",
+                "Witness statements",
+            ],
+            "354": [
+                "Victim statement",
+                "Witness statements",
+                "Medical examination report",
+                "Scene evidence",
+            ],
+            "506": [
+                "Threat communication proof",
+                "Victim statement",
+                "Call detail records (CDR)",
+            ],
+            "363": [
+                "Age/identity proof",
+                "Tracing/recovery evidence",
+                "Guardian or victim statement",
+                "Witness statements",
+            ],
+            "384": [
+                "Demand/proof of extortion",
+                "Threat communication proof",
+                "Victim statement",
+            ],
+            "109": [
+                "Abetment communication evidence",
+                "Call detail records (CDR)",
+                "Independent corroboration",
+            ],
+            "120B": [
+                "Conspiracy communication evidence",
+                "Call detail records (CDR)",
+                "Independent corroboration of conspiracy",
+            ],
+            "34": [
+                "Common intention evidence",
+                "Joint participation witness statements",
+            ],
+        }
+
+        def _is_requirement_present(req: str) -> bool:
+            req_l = req.lower()
+            checks = [
+                (("witness" in req_l or "statement" in req_l or "testimony" in req_l), "witness_statements" in available),
+                (("victim statement" in req_l), "victim_statement" in available or "witness_statements" in available),
+                (("mlc" in req_l or "medical" in req_l or "injury" in req_l), "mlc" in available),
+                (("post-mortem" in req_l or "postmortem" in req_l or "autopsy" in req_l), "postmortem" in available),
+                (("forensic" in req_l or "fsl" in req_l or "fingerprint" in req_l or "ballistic" in req_l), "fsl" in available),
+                (("cctv" in req_l or "camera" in req_l or "footage" in req_l), "cctv" in available),
+                (("cdr" in req_l or "call detail" in req_l or "call record" in req_l), "cdr" in available),
+                (("seizure" in req_l or "recovery" in req_l or "weapon" in req_l or "panchnama" in req_l), "seizure" in available),
+                (("site" in req_l or "scene" in req_l or "spot" in req_l), "site_plan" in available),
+                (("photo" in req_l or "photograph" in req_l), "photos" in available),
+                (("ownership" in req_l or "documentary" in req_l or "entrustment" in req_l), "ownership_docs" in available),
+                (("motive" in req_l), "motive" in available),
+                (("identification" in req_l or "tip" in req_l), "identification" in available),
+            ]
+            for applies, present in checks:
+                if applies:
+                    return present
+
+            req_tokens = set(re.findall(r"[a-z0-9]+", req_l))
+            ctx_tokens = set(re.findall(r"[a-z0-9]+", context.lower()))
             stop = {
                 "the", "and", "with", "from", "that", "this", "were", "was", "have", "has",
-                "for", "into", "under", "case", "fir", "section", "sections", "shall", "should",
-                "must", "need", "required", "evidence", "source", "document", "investigation"
+                "for", "into", "under", "case", "fir", "section", "sections", "evidence", "proof",
             }
-            tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
-            return {t for t in tokens if len(t) > 3 and t not in stop}
+            req_tokens = {t for t in req_tokens if len(t) > 3 and t not in stop}
+            return len(req_tokens & ctx_tokens) >= 2
 
-        def _is_supported_by_source(item: str) -> bool:
-            item_l = item.lower()
-            checks = [
-                (("mlc" in item_l or "medical" in item_l or "medico" in item_l), "mlc" in available),
-                (("site plan" in item_l or "scene" in item_l or "spot map" in item_l), "site_plan" in available),
-                (("witness" in item_l or "161" in item_l), "witness_statements" in available),
-                (("cctv" in item_l or "footage" in item_l or "camera" in item_l), "cctv" in available),
-                (("fsl" in item_l or "forensic" in item_l or "fingerprint" in item_l), "fsl" in available),
-                (("cdr" in item_l or "call detail" in item_l), "cdr" in available),
-                (("seizure" in item_l or "recovery" in item_l or "panchnama" in item_l), "seizure" in available),
-                (("arrest" in item_l), "arrest" in available),
+        def _extract_context_missing_markers(ctx: str) -> list:
+            if not ctx:
+                return []
+
+            collected = []
+            ctx_l = ctx.lower()
+
+            canonical_rules = [
+                ("Eyewitness testimony", [
+                    r"(?:absence\s+of|lack\s+of|no|none|without)[^\n]{0,35}(?:eye\s*[-]?\s*witness|eyewitness|witness)",
+                    r"none\s+of\s+them\s+saw",
+                ]),
+                ("Weapon recovery", [
+                    r"(?:weapon|firearm|gun|pistol|knife|bullet)[^\n]{0,45}(?:not\s+recovered|not\s+found|missing|untraced)",
+                    r"(?:no|without)[^\n]{0,30}(?:weapon|firearm|gun|pistol|knife|bullet)",
+                ]),
+                ("Forensic evidence / FSL report", [
+                    r"(?:forensic|fsl|ballistic|finger\s*print|fingerprint)[^\n]{0,45}(?:not\s+available|missing|inconclusive|could\s+not)",
+                    r"(?:no|without)[^\n]{0,30}(?:forensic|fsl|ballistic|finger\s*print|fingerprint)",
+                ]),
+                ("CCTV footage", [
+                    r"(?:cctv|camera|footage)[^\n]{0,45}(?:not\s+available|not\s+found|missing)",
+                    r"(?:no|without)[^\n]{0,20}(?:cctv|camera|footage)",
+                ]),
+                ("Call detail records (CDR)", [
+                    r"(?:cdr|call\s+detail|call\s+record)[^\n]{0,45}(?:not\s+available|not\s+obtained|missing|could\s+not\s+prove)",
+                    r"(?:no|without|missing)[^\n]{0,25}(?:cdr|call\s+detail|call\s+record)",
+                ]),
+                ("Circumstantial corroboration", [
+                    r"no\s+circumstantial\s+evidence",
+                    r"insufficient\s+physical\s+evidence",
+                ]),
             ]
-            for applies, supported in checks:
-                if applies:
-                    return supported
 
-            if "post-mortem" in item_l or "postmortem" in item_l or "autopsy" in item_l:
-                return bool(re.search(r"post.?mortem|autopsy", context, re.IGNORECASE))
+            for label, patterns in canonical_rules:
+                if any(re.search(pat, ctx_l, re.IGNORECASE) for pat in patterns):
+                    collected.append(label)
 
-            item_tokens = _tokenize_for_overlap(item)
-            if not item_tokens:
-                return False
-            ctx_tokens = _tokenize_for_overlap(context)
-            overlap = len(item_tokens & ctx_tokens)
-            return overlap >= 2
+            marker_pattern = re.compile(
+                r'missing\s+evidence|lack\s+of|absence\s+of|insufficient\s+evidence|'
+                r'no\s+evidence|not\s+(?:recovered|found|available|obtained|proved|established)|'
+                r'could\s+not\s+(?:prove|establish|obtain)|unable\s+to|untraced',
+                re.IGNORECASE,
+            )
 
-        evidence = []
-        evidence_keywords = r'(?:must|should|required?|necessary|essential|obtain|collect|record|examine|recover|produce|establish|verify|need)'
-        for sent in re.split(r'[.!?\n]', reasoning):
-            sent = sent.strip()
-            if not (20 < len(sent) < 220):
-                continue
-            if not re.search(evidence_keywords, sent, re.IGNORECASE):
-                continue
-            if _is_supported_by_source(sent):
-                evidence.append(sent)
+            for raw_line in re.split(r'[\r\n]+', ctx):
+                line = raw_line.strip()
+                if len(line) < 20:
+                    continue
+                if not marker_pattern.search(line):
+                    continue
 
-        filtered = list(dict.fromkeys(evidence))[:8]
+                line = re.sub(r'^\[Chunk\s*\d+\]\s*', '', line, flags=re.IGNORECASE)
+                line = re.sub(r'^(?:missing\s+evidence\s*\d*\s*:|missing\s+evidence\s*:|error\s*:)+\s*', '', line, flags=re.IGNORECASE)
+                line = re.sub(r'\s+', ' ', line).strip(' .')
+                if len(line) >= 12:
+                    collected.append(line[:180])
+
+            return list(dict.fromkeys(collected))[:8]
+
+        def _requirements_from_sections(section_values: list):
+            derived = []
+            mapped = []
+            unmapped = []
+
+            for sec in section_values:
+                base_match = re.match(r'^(\d+)', sec)
+                base = base_match.group(1) if base_match else sec
+                key = sec if sec in section_requirements else base
+                reqs = section_requirements.get(key, [])
+                if reqs:
+                    mapped.append(sec)
+                else:
+                    unmapped.append(sec)
+
+                for req in reqs:
+                    if not _is_requirement_present(req) and req not in derived:
+                        derived.append(req)
+
+            return derived, mapped, unmapped
+
+        def _extract_reasoning_missing_hints(text: str) -> list:
+            if not text:
+                return []
+            candidates = []
+            evidence_keywords = re.compile(
+                r'must|should|required|necessary|essential|obtain|collect|record|examine|recover|produce|establish|verify|need',
+                re.IGNORECASE,
+            )
+            missing_cues = re.compile(
+                r'not\s+mentioned|not\s+available|missing|pending|yet\s+to|could\s+not|unable\s+to|insufficient|lack\s+of',
+                re.IGNORECASE,
+            )
+
+            for sent in re.split(r'[.!?\n]', text):
+                cleaned = sent.strip()
+                if not (20 < len(cleaned) < 220):
+                    continue
+                if not evidence_keywords.search(cleaned):
+                    continue
+                if not missing_cues.search(cleaned):
+                    continue
+                candidates.append(re.sub(r'\s+', ' ', cleaned)[:180])
+
+            return list(dict.fromkeys(candidates))[:5]
+
+        explicit_context_gaps = _extract_context_missing_markers(context)
+        section_gap_candidates, mapped_sections, unmapped_sections = _requirements_from_sections(normalized_sections)
+        reasoning_gap_candidates = _extract_reasoning_missing_hints(reasoning)
+
+        filtered = []
+        for bucket in (explicit_context_gaps, section_gap_candidates, reasoning_gap_candidates):
+            for item in bucket:
+                if item and item not in filtered:
+                    filtered.append(item)
+                if len(filtered) >= 8:
+                    break
+            if len(filtered) >= 8:
+                break
+
+        if not filtered:
+            reasons = []
+            if not normalized_sections:
+                reasons.append("no IPC/BNS sections were extracted from the source")
+            if normalized_sections and not mapped_sections:
+                reasons.append(
+                    "no evidence-template exists for extracted sections "
+                    f"({', '.join(unmapped_sections[:5])})"
+                )
+            if not reasoning or len(reasoning.strip()) < 20:
+                reasons.append("model reasoning did not contain analyzable evidence cues")
+            if not reasons:
+                reasons.append("the case text does not explicitly indicate any missing evidence")
+
+            filtered = [
+                "Unable to derive specific missing evidence from source: " + "; ".join(reasons) + "."
+            ]
+
+        print(
+            "Evidence derivation diagnostics: "
+            f"explicit={len(explicit_context_gaps)}, "
+            f"section_based={len(section_gap_candidates)}, "
+            f"reasoning_based={len(reasoning_gap_candidates)}, "
+            f"mapped_sections={mapped_sections}, "
+            f"unmapped_sections={unmapped_sections}"
+        )
         print(f"Source-supported missing-evidence items: {len(filtered)}")
         return filtered
 
@@ -1277,6 +1741,61 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
         summary   = extract_section_text(restored, "Summary")
         reasoning = extract_section_text(restored, "Reasoning")
         decision  = extract_section_text(restored, "Decision")
+        model_gap_text = extract_section_text(restored, "Evidence Gaps")
+        if not model_gap_text:
+            model_gap_text = extract_section_text(restored, "Missing Evidence")
+
+        def _complete_text(text: str, min_sentence_chars: int = 80) -> str:
+            """
+            Normalize generated text and avoid returning dangling fragments
+            when decoding stops mid-sentence.
+            """
+            if not text:
+                return ""
+
+            cleaned = re.sub(r'[ \t]+', ' ', text)
+            cleaned = re.sub(r'\s*\n\s*', '\n', cleaned).strip()
+            if not cleaned:
+                return ""
+
+            if re.search(r'[.!?]["\')\]]?\s*$', cleaned):
+                return cleaned
+
+            last_sentence_end = max(cleaned.rfind('.'), cleaned.rfind('!'), cleaned.rfind('?'))
+            if last_sentence_end >= min_sentence_chars:
+                return cleaned[:last_sentence_end + 1].strip()
+
+            cleaned = re.sub(
+                r'\b(?:and|or|the|a|an|to|of|in|on|with|by|for|from|under|at|within|thereafter|thereby)\s*$',
+                '',
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            if cleaned and cleaned[-1].isalnum() and len(cleaned.split()) >= 8:
+                cleaned += '.'
+            return cleaned
+
+        def _parse_model_gap_lines(text: str) -> list:
+            if not text:
+                return []
+            parsed = []
+            for line in text.splitlines():
+                cleaned = re.sub(r'^\s*(?:[-*]|\d+\.)\s*', '', line.strip())
+                cleaned = cleaned.strip(' .')
+                if len(cleaned) < 5:
+                    continue
+                if re.match(r'^(summary|reasoning|decision|label)\s*:', cleaned, re.IGNORECASE):
+                    continue
+                parsed.append(cleaned[:180])
+
+            if not parsed:
+                for chunk in re.split(r';|\.\s+', text):
+                    cleaned = chunk.strip(' -*.\t\r\n')
+                    if len(cleaned) >= 8:
+                        parsed.append(cleaned[:180])
+
+            return list(dict.fromkeys(parsed))[:8]
 
         
         if not summary and reasoning:
@@ -1288,7 +1807,11 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
             reasoning = restored.strip()
         if not decision:
             parts = re.split(r'\nDecision\s*:', restored, flags=re.IGNORECASE)
-            decision = parts[1].strip()[:600] if len(parts) > 1 else ""
+            decision = parts[1].strip() if len(parts) > 1 else ""
+
+        summary = _complete_text(summary)
+        reasoning = _complete_text(reasoning)
+        decision = _complete_text(decision)
 
         print(f"Summary   excerpt: {summary[:200]}")
         print(f"Reasoning excerpt: {reasoning[:200]}")
@@ -1309,7 +1832,45 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
                 accused = gen_acc
 
         offenses = build_offenses_from_sections(sections, reasoning, context)
-        missing_evidence = extract_missing_evidence_from_reasoning(reasoning, context)
+        missing_evidence = extract_missing_evidence_from_reasoning(reasoning, context, sections)
+        model_evidence_gaps = _parse_model_gap_lines(model_gap_text)
+
+        # Merge parser-derived and model-provided gaps while preferring grounded parser output.
+        gap_keywords = re.compile(
+            r'witness|eyewitness|statement|mlc|medical|injury|forensic|fsl|fingerprint|'
+            r'cctv|camera|footage|cdr|call\s+detail|recovery|seizure|panchnama|'
+            r'weapon|motive|identification|ownership|post[-\s]?mortem|autopsy',
+            re.IGNORECASE,
+        )
+
+        def _is_gap_grounded_to_context(gap_text: str, source_text: str) -> bool:
+            if not gap_text or not source_text:
+                return False
+            gap_tokens = set(re.findall(r'[a-z0-9]+', gap_text.lower()))
+            src_tokens = set(re.findall(r'[a-z0-9]+', source_text.lower()))
+            stop = {
+                'the', 'and', 'with', 'from', 'that', 'this', 'were', 'was', 'have', 'has',
+                'for', 'into', 'under', 'case', 'fir', 'section', 'sections', 'evidence',
+                'missing', 'not', 'source', 'mentioned',
+            }
+            gap_tokens = {t for t in gap_tokens if len(t) > 3 and t not in stop}
+            return len(gap_tokens & src_tokens) >= 2
+
+        for gap in model_evidence_gaps:
+            if gap in missing_evidence:
+                continue
+            if gap_keywords.search(gap) and _is_gap_grounded_to_context(gap, context):
+                missing_evidence.append(gap)
+            if len(missing_evidence) >= 8:
+                break
+
+        normalized_section_list = []
+        for sec in sections or []:
+            normalized = normalize_section_token(str(sec))
+            if normalized and normalized not in normalized_section_list:
+                normalized_section_list.append(normalized)
+        normalized_section_list = sorted(normalized_section_list, key=_section_sort_key)
+
         offense_labels = ', '.join([o.split(' - ')[0] for o in offenses[:3]])
         offense_desc   = ', '.join([o.split(' - ')[-1] for o in offenses[:2]]).lower()
 
@@ -1363,6 +1924,7 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
                 meta_parts.append(f"reported at {ps_str} Police Station")
             if meta_parts:
                 final_summary += f" ({', '.join(meta_parts)})"
+            final_summary = _complete_text(final_summary)
         else:
             # Programmatic fallback — build purely factual (no section numbers)
             s1 = f"{complainant} filed an FIR against {accused} for {offense_desc}."
@@ -1380,10 +1942,11 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
             s3 = factual_sents[0] if factual_sents else (reasoning_sents[0] if reasoning_sents else "")
             s3 = _strip_sections_from_summary(s3)
             final_summary = " ".join(filter(None, [s1, s2, s3]))
+            final_summary = _complete_text(final_summary)
 
         
         if decision and len(decision.strip()) > 30:
-            recommendation = decision.strip()[:600]
+            recommendation = _complete_text(decision.strip())
         else:
             recommendation = (
                 f"The Investigating Officer should complete the investigation and file a chargesheet "
@@ -1393,10 +1956,12 @@ async def analyze_legal_case(case_id: str, raw_english_text: str = None, hint_se
                 f"(4) {'Identify accused through investigation' if 'unidentified' in accused.lower() else f'Arrest and question {accused}'}; "
                 f"(5) Comply with all CrPC procedural requirements."
             )
+        recommendation = _complete_text(recommendation)
 
         return {
             "summary": final_summary,
             "offenses": offenses,
+            "sections": normalized_section_list,
             "missing_evidence": missing_evidence,
             "recommendation": recommendation,
         }
